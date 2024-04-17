@@ -1,0 +1,322 @@
+import pandas as pd
+# Azure Function Libraries
+import azure.functions as func
+# SQL Database connection Libraries
+import pyodbc
+import urllib
+import sqlalchemy
+from urllib.parse import quote_plus
+# Azure Blob Storage connection Libraries
+from azure.storage.blob import BlobServiceClient
+# Key Vault Libraries
+from azure.identity import ClientSecretCredential
+from azure.keyvault.secrets import SecretClient
+# Sending Email Libraries
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
+# Read csv file Libraries
+from io import StringIO, BytesIO
+import warnings
+import logging
+import openpyxl
+
+import AzureCreadential
+
+warnings.filterwarnings('ignore')
+
+app = func.FunctionApp()
+
+Schema_name = AzureCreadential.Schema_name
+secret_mailname = AzureCreadential.secret_mailname 
+secret_dbpass =AzureCreadential.secret_dbpass 
+client_id =AzureCreadential.client_id 
+client_secret =AzureCreadential.client_secret  
+tenant_id =AzureCreadential.tenant_id 
+key_vault_url = AzureCreadential.key_vault_url
+connect_str =AzureCreadential.connect_str 
+blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+input_container_name =AzureCreadential.input_container_name 
+processed_container_name =AzureCreadential.processed_container_name 
+
+Replace_values=["#NUM!","#REF!","n.a.","--","TRUE","na","- x","FALSE","OK","?","N/A - Cash not invested","Error - B/S non-zero ","Error - B/S non-zero EIR Error Tax Losses not utilised","Error - B/S non-zero Tax Losses not utilised","Error - Tax Losses not utilised"]
+
+
+# Get Email password using key vault
+def get_databaseAndmail_password(secret_name):
+    credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    rv = SecretClient(vault_url=key_vault_url, credential=credential).get_secret(secret_name)
+    return rv.value
+    
+# Main Timeline Data function
+def test(myblob,blob_name):
+    
+    # SQL Database Connections
+    port =AzureCreadential.port
+    server =AzureCreadential.server 
+    database =AzureCreadential.database 
+    username =AzureCreadential.username 
+    password =get_databaseAndmail_password(secret_dbpass)                                                                           #get_database_password(tenant_id, client_id, client_secret, key_vault_url)
+    driver =AzureCreadential.driver 
+    sqlconnectionstring=AzureCreadential.sqlconnectionstring  
+    conn = pyodbc.connect(sqlconnectionstring)
+
+    Discrete_tablename = 'tblDiscreteData'
+    Discrete_path = f"{input_container_name}/Discrete_Data/"
+    Discrete_proc = "Base.ProcessDiscreteData"
+    if blob_name.startswith(Discrete_path) and blob_name.endswith('.csv'):
+        read_csv_files(Discrete_proc,Discrete_path,Discrete_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    Discrete_Sen_tablename = 'tblDiscreteData_Sen'
+    Discrete_sen_path = f"{input_container_name}/Discrete_Data_Sen/"
+    Discrete_sen_proc = "[Base].[procMigrateInputDataToClientLayertemp]"
+    if blob_name.startswith(Discrete_sen_path) and blob_name.endswith('.csv'):
+        read_csv_files(Discrete_sen_proc,Discrete_sen_path,Discrete_Sen_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    Timeline_tablename = 'tblTimelineData'
+    Timeline_path = f'{input_container_name}/Timeline_Data/'
+    Timeline_proc = 'Base.ProcessTimelineData'
+    if blob_name.startswith(Timeline_path) and blob_name.endswith('.csv'):
+        read_csv_files(Timeline_proc,Timeline_path,Timeline_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    Timeline_sen_tablename = 'tblTimelineData_Sen'
+    Timeline_sen_path = f'{input_container_name}/Timeline_Data_Sen/'
+    Timeline_sen_proc = 'Base.ProcessTimelineSenData'
+    if blob_name.startswith(Timeline_sen_path) and blob_name.endswith('.csv'):
+        read_csv_files(Timeline_sen_proc,Timeline_sen_path,Timeline_sen_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    pwc_path = f'{input_container_name}/PwC/'
+    pwc_tablename = 'tblPwCThirdParty'
+    pwc_procname = '[Client].[Usp_Load_DimPWCThirdParty]'
+    if blob_name.startswith(pwc_path) and blob_name.endswith('.csv'):
+        print(blob_name)
+        pwc_data(pwc_procname,pwc_path,pwc_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    fx_path = f'{input_container_name}/FX/'
+    fx_tablename = 'tblFX'
+    fx_procname = "[Client].[Usp_Load_TblFX]"
+    if blob_name.startswith(fx_path) and blob_name.endswith('.csv'):
+        pwc_data(fx_procname,fx_path,fx_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+    pcf_path = f'{input_container_name}/ProjectCashFlow/'
+    pcf_tablename = 'tblFinTeam_Cash'
+    pcf_procname = 'Client.Usp_Load_tblFinTeamCash'
+    if blob_name.startswith(pcf_path) and blob_name.endswith('.xlsx'):
+        pcf_data(pcf_procname,pcf_path,pcf_tablename,conn,myblob,blob_name,sqlconnectionstring)
+
+
+def move_blob_to_processed_container(file_name):
+    source_blob = blob_service_client.get_blob_client(container=input_container_name, blob=file_name)
+    destination_blob = blob_service_client.get_blob_client(container=processed_container_name, blob=file_name)
+    destination_blob.start_copy_from_url(source_blob.url)
+    source_blob.delete_blob()
+#upload to SQL database table function
+def upload_to_sql(timeline_df, sqlconnectionstring, Data_tablename):
+    db_params = urllib.parse.quote_plus(sqlconnectionstring)
+    engine = sqlalchemy.create_engine("mssql+pyodbc:///?odbc_connect={}".format(db_params), fast_executemany=True)
+    timeline_df.to_sql(Data_tablename, engine, index=False, if_exists="append", schema=Schema_name)
+# Conut the number of files
+def count_files_in_path(proc_final_path,QuarterCD):
+    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+    container_client = blob_service_client.get_container_client(input_container_name)
+    # blobs_list = container_client.list_blobs(name_starts_with=csv_files_path + {QuarterCD})
+    blobs_list = container_client.list_blobs(name_starts_with=f"{proc_final_path}{QuarterCD}")
+    file_count = sum(1 for _ in blobs_list)
+    return file_count
+# send Emails 
+def mail(subject1,body1):
+    smtp_server = 'smtp.office365.com'
+    smtp_port = 587  
+    smtp_username = 'jldataopssupport@equipped.ai'
+    smtp_password =get_databaseAndmail_password(secret_mailname)                                                  #get_email_password(tenant_id, client_id, client_secret, key_vault_url)
+    # Sender and recipient details
+    sender = 'jldataopssupport@equipped.ai'
+    recipient = 'entermailid'
+    message = MIMEMultipart()
+    message['From'] = sender
+    message['To'] = recipient
+    message['Subject'] = subject1
+    body = body1
+    message.attach(MIMEText(body, 'html'))
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.send_message(message)
+
+def store_proc(conn,file_path,main_proc):
+    try:
+        conn.timeout = 0
+        conn.execute(main_proc)
+        conn.commit()
+        subject1 = f"INFO: (Dev) {file_path} CSV File Upload"
+        body1 = f"<b>Job Status: <span style=\"color: green;\">SUCCESS</span></b><p><b>Description:</b> This {main_proc} proc executed successfully<p>"
+        mail(subject1,body1)
+
+    except Exception as e:
+        error_message = str(e)
+
+        subject1 = f"ERROR: (Dev) {file_path} CSV File Upload"
+        body1 = f"<b>Job Status: <span style=\"color: red;\">FAILED</span></b><p><b>Description:</b> This {main_proc} proc executed Failed<p><b> Error: </b>{error_message}"
+        mail(subject1,body1)
+
+def read_csv_files(proc_name,Data_path,Data_tablename,conn,myblob,blob_name,sqlconnectionstring):
+    file_path = Data_path.split('/')[1]
+    try:
+        Timeline_query = "SELECT * from "+Schema_name+"."+Data_tablename+" where 1=0"
+        timeline_df = pd.read_sql(Timeline_query, conn) 
+        csvdf = pd.read_csv(BytesIO(myblob.read()), encoding='latin-1')
+        csvdf.dropna(how='all', axis=1, inplace=True)
+        # based on folder & files names getting QuarterCD,Assetname & Assetcode
+        QuarterCD = blob_name.split('/') [2]
+        csvdf['QuarterCD'] = QuarterCD
+        asset_name = blob_name.split('/')[3].split(" ")[0]
+        csvdf['AssetName'] = asset_name
+        asset_code =blob_name.split('/')[3].split()[1] + ' ' +blob_name.split('/')[3].split()[2].replace("-1.csv", "").replace(".csv", "")
+        asset_code=asset_code.split('-')[0]
+        csvdf['AssetCode'] = asset_code
+        csvdf.replace(Replace_values, '', inplace=True)
+        ## Data deleted in database, based on Quarter name and assetname   
+        query = f"DELETE FROM {Schema_name}.{Data_tablename} where [QuarterCD]='{QuarterCD}' and [AssetName]= '{asset_name}' and [AssetCode] = '{asset_code}'"
+        cursor = conn.cursor()
+        cursor.execute(query)
+        conn.commit()
+        cursor.close()
+        #match woth the database table columns
+        common_columns = set(timeline_df.columns).intersection(set(csvdf.columns))
+        csvdf = csvdf[list(common_columns)]
+        timeline_df = pd.concat([timeline_df, csvdf], ignore_index=True)
+        upload_to_sql(timeline_df, sqlconnectionstring, Data_tablename)
+
+        csv_record_count = len(timeline_df)
+        cursor = conn.cursor()
+        query1 = f"SELECT COUNT(*) FROM {Schema_name}.{Data_tablename} WHERE QuarterCD = '{QuarterCD}' and AssetName ='{asset_name}' and assetcode='{asset_code}'"  # Adjust AssetName with your actual column name
+        cursor.execute(query1)
+        db_record_count = cursor.fetchone()[0]
+        file_name = blob_name.replace(f"{input_container_name}/", "")
+
+        if csv_record_count ==  db_record_count:
+            match_details=(f"matched: CSV records ({csv_record_count}) in {blob_name} match DB records ({db_record_count})<br>")
+
+            move_blob_to_processed_container(file_name)
+            input_path = blob_name.replace(" ","")
+            processed_path = blob_name.replace(f"{input_container_name}/", f"{processed_container_name}/").replace(" ","")
+
+            subject1 = f"INFO: (Dev) {file_path} CSV File Upload"
+            body1 = f"<b>Job Status: <span style=\"color: green;\">SUCCESS</span></b><p><b>Input File Location:</b> https://johnlaingqastorage.blob.core.windows.net/{input_path}<p><b>No Of Records In CSV File:</b> {csv_record_count}<p><b>No Of Records Processed In DB:</b> {db_record_count}<p><b>Processed File Moved To:</b> https://johnlaingqastorage.blob.core.windows.net/{processed_path}"
+            mail(subject1,body1)
+
+        else:
+            mismatch_details=(f"Mismatch: CSV records ({csv_record_count}) in {blob_name} do not match DB records ({db_record_count})")
+            input_path = blob_name.replace(" ","")
+
+            subject1 = f"ERROR: (Dev) {file_path} CSV File Upload"
+            body1 = f"<b>Job Status: <span style=\"color: red;\">FAILED</span></b><p><b>Input File Location:</b> https://johnlaingqastorage.blob.core.windows.net/{input_path}<p><b>No Of Records In CSV File:</b> {csv_record_count}<p><b>No Of Records Processed In DB:</b> {db_record_count}<p>"
+            mail(subject1,body1)
+
+        proc_final_path = Data_path.split('/')[1] +"/"
+        total_files= count_files_in_path(proc_final_path,QuarterCD)
+        count = total_files - 1
+
+        if count == 0:
+            store_proc(conn,file_path,proc_name)
+        # except 
+    except Exception as e:
+            error_message = str(e)
+            subject1 = f"ERROR: (Dev) {file_path} CSV File Upload"
+            body1 = f"<b>Job Status: <span style=\"color: red;\">FAILED</span></b><p><b>ERROR</b> {error_message}"
+            mail(subject1,body1)
+
+def pwc_data(proc_name,Data_path,Data_tablename,conn,myblob,blob_name,sqlconnectionstring):
+    file_path = Data_path.split('/')[1]
+    try:
+        Timeline_query = "SELECT * from "+Schema_name+"."+Data_tablename+" where 1=0"
+        timeline_df = pd.read_sql(Timeline_query, conn) 
+        csvdf = pd.read_csv(BytesIO(myblob.read()))
+        csvdf.dropna(how='all', axis=1, inplace=True)
+        # based on folder & files names getting QuarterCD,Assetname & Assetcode
+        QuarterCD = blob_name.split('/') [2]
+        try: ## 
+            csvdf['ValuationDate'] = QuarterCD
+            # csvdf['ValuationDate'] = pd.to_datetime(QuarterCD, format='%YQ%m')
+            csvdf['Diff']=csvdf['MaxValue'] - csvdf['MinValue']
+        except:
+            logging.info("formate not correct")
+        try:
+            csvdf['FXDate']=QuarterCD
+        except:
+            logging.info("formate not correct")
+        #match woth the database table columns
+        common_columns = set(timeline_df.columns).intersection(set(csvdf.columns))
+        csvdf = csvdf[list(common_columns)]
+        timeline_df = pd.concat([timeline_df, csvdf], ignore_index=True)
+        upload_to_sql(timeline_df, sqlconnectionstring, Data_tablename)
+
+        csv_record_count = len(timeline_df)
+        file_name = blob_name.replace(f"{input_container_name}/", "")
+        move_blob_to_processed_container(file_name)
+        input_path = blob_name.replace(" ","")
+        processed_path = blob_name.replace(f"{input_container_name}/", f"{processed_container_name}/").replace(" ","")
+
+        subject1 = f"INFO: (Dev) {file_path} CSV File Upload"
+        body1 = f"<b>Job Status: <span style=\"color: green;\">SUCCESS</span></b><p><b>Input File Location:</b> https://johnlaingqastorage.blob.core.windows.net/{input_path}<p><b>No Of Records In CSV File:</b> {csv_record_count}<p><b>Processed File Moved To:</b> https://johnlaingqastorage.blob.core.windows.net/{processed_path}"
+        mail(subject1,body1)
+
+        proc_final_path = Data_path.split('/')[1] +"/"
+        total_files= count_files_in_path(proc_final_path,QuarterCD)
+        count = total_files - 1
+
+        if count == 0:
+            store_proc(conn,file_path,proc_name)
+    except Exception as e:
+            error_message = str(e)
+            subject1 = f"ERROR: (Dev) {file_path} CSV File Upload"
+            body1 = f"<b>Job Status: <span style=\"color: red;\">FAILED</span></b><p><b>ERROR</b> {error_message}"
+            mail(subject1,body1)
+
+def pcf_data(proc_name,Data_path,Data_tablename,conn,myblob,blob_name,sqlconnectionstring):
+    file_path = Data_path.split('/')[1]
+    try:
+        Timeline_query = "SELECT * from "+Schema_name+"."+Data_tablename+" where 1=0"
+        timeline_df = pd.read_sql(Timeline_query, conn) 
+        csvdf = pd.read_excel(BytesIO(myblob.read()))
+        csvdf.dropna(how='all', axis=1, inplace=True)
+        # based on folder name getting QuarterCD
+        QuarterCD = blob_name.split('/') [2]
+        csvdf['Quarter'] = QuarterCD
+        csvdf ['AssetCo/DevCo']=csvdf['Devco_or_Assetco']
+        # match woth the database table columns
+        common_columns = set(timeline_df.columns).intersection(set(csvdf.columns))
+        csvdf = csvdf[list(common_columns)]
+        timeline_df = pd.concat([timeline_df, csvdf], ignore_index=True)
+        file_name = blob_name.replace(f"{input_container_name}/", "")
+        # upload the data to the SQL database tables
+        upload_to_sql(timeline_df, sqlconnectionstring, Data_tablename)
+        csv_record_count = len(timeline_df)
+
+        move_blob_to_processed_container(file_name)
+        input_path = blob_name.replace(" ","")
+        processed_path = blob_name.replace(f"{input_container_name}/", f"{processed_container_name}/").replace(" ","")
+
+        subject1 = f"INFO: (Dev) {file_path} CSV File Upload"
+        body1 = f"<b>Job Status: <span style=\"color: green;\">SUCCESS</span></b><p><b>Input File Location:</b> https://johnlaingqastorage.blob.core.windows.net/{input_path}<p><b>No Of Records In CSV File:</b> {csv_record_count}<p><b>Processed File Moved To:</b> https://johnlaingqastorage.blob.core.windows.net/{processed_path}"
+        mail(subject1,body1)
+
+        proc_final_path = Data_path.split('/')[1] +"/"
+        total_files= count_files_in_path(proc_final_path,QuarterCD)
+        count = total_files - 1
+
+        if count == 0:
+            # main_proc = proc_name
+            store_proc(conn,file_path,proc_name)
+    except Exception as e:
+            error_message = str(e)
+            subject1 = f"ERROR: (Dev) {file_path} CSV File Upload"
+            body1 = f"<b>Job Status: <span style=\"color: red;\">FAILED</span></b><p><b>ERROR</b> {error_message}"
+            mail(subject1,body1)
+
+#blobpath="{}/{name}".format(input_container_name)
+@app.blob_trigger(arg_name="myblob", path="devinputdata/{name}", connection="AzureWebJobsStorage")
+def Dev_Final(myblob: func.InputStream):
+    blob_name=myblob.name
+    test(myblob,blob_name)
+    logging.info(f"Python blob trigger function processed blob" f"Name: {myblob.name}")
